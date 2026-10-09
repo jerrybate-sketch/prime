@@ -1,0 +1,47 @@
+name: Prime batch liveness Linux validation
+
+on:
+  push:
+    branches: ["codex/validate-batch-liveness"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    env:
+      PRIME_API_KEY: ""
+      PRIME_TEAM_ID: ""
+      PRIME_CONTEXT: ""
+      PRIME_LIVE_VM_SMOKE: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - name: Install only the sandbox package and test dependencies
+        run: uv pip install --system --exclude-newer "7 days" './packages/prime-sandboxes[dev]'
+      - name: Baseline failure, real Linux shell acceptance, and full SDK suite
+        run: python .validation/run_linux_validation.py --repo . --output validation-results
+      - name: Retain exact validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-batch-linux-python-${{ matrix.python }}
+          path: validation-results/
+          if-no-files-found: error
+          retention-days: 30
