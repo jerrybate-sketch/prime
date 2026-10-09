@@ -69,7 +69,33 @@ class LocalTransport:
         self.active_probes = 0
         self.peak_probes = 0
         self.jobs = []
+        self.job_names = {}
         self.probe_records = []
+        self.pending_observations = []
+        self.gates = {
+            name: guest_path(f"/tmp/job_{uuid.uuid4().hex[:8]}.release")
+            for name in ("live-slow", "legacy-no-pid")
+        }
+
+    def gated_command(self, name):
+        gate = shlex.quote(str(self.gates[name]))
+        # The loop also bounds orphan lifetime if this diagnostic is interrupted.
+        return (
+            f"n=0; while [ ! -e {gate} ] && [ $n -lt 250 ]; "
+            f"do n=$((n+1)); sleep 0.02; done; test -e {gate} || exit 91; printf {name}"
+        )
+
+    def observe_pending(self, job_id, kind):
+        name = self.job_names.get(job_id)
+        if name not in self.gates:
+            return
+        pid_exists = guest_path(f"/tmp/job_{job_id}.launch/pid").exists()
+        self.pending_observations.append(
+            {"scenario": name, "job_id": job_id, "kind": kind, "pid_exists": pid_exists}
+        )
+        if (ARGS.expect == "baseline" and kind == "batch") or kind == "probe":
+            # A healthy gated job cannot complete before its pending observation.
+            self.gates[name].touch()
 
     async def request(self, method, path, **kwargs):
         assert (method, path) == ("POST", "/sandbox/background-jobs/status:batchGet")
@@ -81,6 +107,8 @@ class LocalTransport:
             statuses.append(
                 {**item, "completed": bool(content), "exit_code": int(content) if content else None}
             )
+            if not content:
+                self.observe_pending(item["job_id"], "batch")
         return {"statuses": statuses, "errors": []}
 
     async def execute(self, sandbox_id, command, **kwargs):
@@ -121,6 +149,10 @@ class LocalTransport:
                     "exit_code": result.exit_code,
                 }
             )
+            for line in result.stdout.splitlines():
+                job_id, separator, status = line.partition(" ")
+                if separator and not status:
+                    self.observe_pending(job_id, "probe")
         return result
 
     async def read(self, sandbox_id, path, **kwargs):
@@ -152,6 +184,8 @@ class LocalTransport:
             launch_dir = guest_path(f"/tmp/job_{job.job_id}.launch")
             if launch_dir.exists():
                 launch_dir.rmdir()
+        for gate in self.gates.values():
+            gate.unlink(missing_ok=True)
 
 
 async def run():
@@ -162,6 +196,7 @@ async def run():
     client.execute_command = transport.execute
     client.read_file = transport.read
     original_start = client.start_background_job
+    slow_command = transport.gated_command("live-slow")
 
     async def start(*args, **kwargs):
         if args[1] == "legacy-no-pid":
@@ -170,7 +205,8 @@ async def run():
             # exit/output files, but no launch/pid metadata. This healthy job must
             # not become a false infrastructure failure after an SDK update.
             body = (
-                f"(sleep 0.6; printf legacy-no-pid) > {shlex.quote(job.stdout_log_file)} "
+                f"({transport.gated_command('legacy-no-pid')}) "
+                f"> {shlex.quote(job.stdout_log_file)} "
                 f"2> {shlex.quote(job.stderr_log_file)}; echo $? > {shlex.quote(job.exit_file)}"
             )
             await transport.execute(
@@ -179,6 +215,10 @@ async def run():
         else:
             job = await original_start(*args, **kwargs)
         transport.jobs.append(job)
+        if args[1] == "legacy-no-pid":
+            transport.job_names[job.job_id] = "legacy-no-pid"
+        elif args[1] == slow_command:
+            transport.job_names[job.job_id] = "live-slow"
         return job
 
     async def context(*args, **kwargs):
@@ -189,7 +229,7 @@ async def run():
     scenarios = [
         ("normal-zero", "printf normal-zero", 0),
         ("normal-nonzero", "printf normal-nonzero; exit 3", 3),
-        ("live-slow", "sleep 0.6; printf live-slow", 0),
+        ("live-slow", slow_command, 0),
         ("legacy-no-pid", "legacy-no-pid", 0),
         ("lost-wrapper", "kill -9 $$", None),
     ]
@@ -236,6 +276,16 @@ async def run():
         assert lost["kind"] == expected_kind, results
         if ARGS.expect == "fixed":
             assert "without recording an exit code" in lost["message"], lost
+        observed_kind = "probe" if ARGS.expect == "fixed" else "batch"
+        for name in ("live-slow", "legacy-no-pid"):
+            observations = [
+                item
+                for item in transport.pending_observations
+                if item["scenario"] == name and item["kind"] == observed_kind
+            ]
+            assert observations, (name, transport.pending_observations)
+            if name == "legacy-no-pid":
+                assert all(not item["pid_exists"] for item in observations), observations
         report = {
             "state": "passed",
             "expectation": ARGS.expect,
@@ -255,11 +305,26 @@ async def run():
             "probe_calls": transport.probe_calls,
             "peak_probes": transport.peak_probes,
             "probe_records": transport.probe_records,
+            "pending_observations": transport.pending_observations,
+            "scenario_job_ids": {name: job_id for job_id, name in transport.job_names.items()},
         }
         ARGS.output.parent.mkdir(parents=True, exist_ok=True)
         ARGS.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps({k: v for k, v in report.items() if k != "probe_records"}, indent=2))
     finally:
+        for gate in transport.gates.values():
+            gate.touch()
+        # Release diagnostic jobs and let their bounded wrappers finish before
+        # removing their exact artifacts, including on an assertion failure.
+        for _ in range(100):
+            pending = [
+                job
+                for job in transport.jobs
+                if job.job_id in transport.job_names and not guest_path(job.exit_file).exists()
+            ]
+            if not pending:
+                break
+            await asyncio.sleep(0.02)
         await client.aclose()
         transport.cleanup()
 

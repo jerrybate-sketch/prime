@@ -10,12 +10,21 @@ permissions:
 
 jobs:
   linux-validation:
+    name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.12"]
+        include:
+          - python: "3.10"
+            label: Linux 3.10 upstream compatibility diagnostic
+          - python: "3.11"
+            label: Linux 3.11 full validation
+          - python: "3.12"
+            label: Linux 3.12 full validation
+          - python: "3.13"
+            label: Linux 3.13 full validation
     env:
       PRIME_API_KEY: ""
       PRIME_TEAM_ID: ""
